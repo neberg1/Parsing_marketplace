@@ -1,254 +1,358 @@
 import requests
 import json
-import csv
+import sqlite3
 import time
 import math
 import logging
 import concurrent.futures
-import sqlite3
+import queue
+import threading
 from bs4 import BeautifulSoup
-from db_setup import upsert_products, setup_database
+from datetime import datetime
 
-# SETUP DETAILED LOGGER (Saves to a file AND prints to your screen)
+# ==========================================
+# 1. SETUP & LOGGING
+# ==========================================
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("prom_scraper_engine.log", encoding='utf-8'),
+        logging.FileHandler("market_tracker.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 
-def fetch_and_extract_page(url, page_num, category_alias):
+DB_NAME = "prom_market_dynamics.db"
+
+# ==========================================
+# 2. DATABASE INITIALIZATION
+# ==========================================
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Tracks the actual scrape jobs
+    cursor.execute('''CREATE TABLE IF NOT EXISTS scrape_sessions (
+            session_id INTEGER PRIMARY KEY,
+            run_type TEXT,
+            target_category TEXT,
+            status TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )''')
+        
+    # The Time-Series Database (Appends only)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS ranking_history (
+            history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER,
+            product_id TEXT,
+            category_alias TEXT,
+            name TEXT,
+            url TEXT,
+            category_position INTEGER,
+            price REAL,
+            stock_status TEXT
+        )''')
+        
+    # The Delta Table (Stores the changes detected between runs)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS market_alerts (
+            alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER,
+            product_id TEXT,
+            category_alias TEXT,
+            alert_type TEXT,
+            message TEXT
+        )''')
+        
+    # Indices for blazing fast SQL comparisons
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_session_cat ON ranking_history(session_id, category_alias);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_prod_session ON ranking_history(product_id, session_id);")
+    
+    conn.commit()
+    conn.close()
+
+# ==========================================
+# 3. THE BACKGROUND WRITER (NO-BLOCKING DB)
+# ==========================================
+def db_writer_worker(data_queue):
     """
-    Downloads a single page. If the server drops the connection or returns an error,
-    it attempts an in-line retry with a brief pause before reporting a failure.
+    Runs in the background. Constantly pulls data from the scrapers' memory queue 
+    and bulk-inserts it into SQLite. This ensures the 48 scrapers NEVER pause.
     """
+    conn = sqlite3.connect(DB_NAME, timeout=30)
+    cursor = conn.cursor()
+    batch = []
+    
+    while True:
+        item = data_queue.get()
+        if item is None: # Sentinel value meaning "Scraping is done, shut down"
+            if batch:
+                cursor.executemany('''INSERT INTO ranking_history 
+                    (session_id, product_id, category_alias, name, url, category_position, price, stock_status) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', batch)
+                conn.commit()
+            break
+            
+        batch.append(item)
+        
+        # Dump to database every 500 items
+        if len(batch) >= 500:
+            cursor.executemany('''INSERT INTO ranking_history 
+                    (session_id, product_id, category_alias, name, url, category_position, price, stock_status) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', batch)
+            conn.commit()
+            batch = []
+            
+        data_queue.task_done()
+        
+    conn.close()
+
+# ==========================================
+# 4. THE HIGH-SPEED SCRAPER LOGIC
+# ==========================================
+def fetch_and_extract_page(session_id, target_url, page_num, category_alias, data_queue, page_1_anchor_id=None):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8"
     }
     
-    max_inline_retries = 3
-    for attempt in range(1, max_inline_retries + 1):
+    for attempt in range(1, 4):
         try:
-            response = requests.get(url, headers=headers, timeout=12)
+            # allow_redirects=True is default, but we will catch it in response.url
+            response = requests.get(target_url, headers=headers, timeout=12)
             
             if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
                 
+                # 🟢 CHECK 1: Did Prom.ua redirect us?
+                if page_num > 1 and f";{page_num}" not in response.url:
+                    
+                    return 0, None
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
                 for script in soup.find_all('script'):
                     script_text = str(script.string)
                     if 'window.ApolloCacheState' in script_text:
-                        start_marker = "window.ApolloCacheState = "
-                        start_idx = script_text.find(start_marker) + len(start_marker)
-                        json_candidate = script_text[start_idx:].strip()
+                        start_idx = script_text.find("window.ApolloCacheState = ") + 26
+                        raw_json = script_text[start_idx:].strip()
                         
-                        decoder = json.JSONDecoder()
-                        cache_data, _ = decoder.raw_decode(json_candidate)
+                        cache_data, _ = json.JSONDecoder().raw_decode(raw_json)
                         fast_cache = cache_data.get('_FAST_CACHE', {})
-                        search_key = next((k for k in fast_cache.keys() if 'SearchListingQuery' in k or 'CategoryListingQuery' in k or 'Catalog' in k), None)
+                        search_key = next((k for k in fast_cache.keys() if 'ListingQuery' in k or 'Catalog' in k), None)
                         
                         if search_key:
                             total_items = fast_cache[search_key]['result']['listing']['page']['total']
                             products = fast_cache[search_key]['result']['listing']['page']['products']
                             
-                            clean_products = [] 
-                            for item in products:
-                                product_info = item.get('product', {})
+                            if not products:
+                                return 0, None
                                 
-                                if product_info:
-                                    # 1. Core Identifiers
-                                    product_id = product_info.get('id')
-                                    url_product = f"https://prom.ua/ua/p{product_id}-{product_info.get('urlText', '')}.html"
-                                    
-                                    # 2. Company Info
-                                    company = product_info.get('company', {})
-                                    stats = company.get('opinionStats', {})
-                                    
-                                    # 3. Brand / Manufacturer extraction
-                                    manufacturer = product_info.get('manufacturerInfo') or {}
-                                    brand_name = manufacturer.get('name', 'Unknown')
-                                    
-                                    # 4. Stock Status extraction
-                                    presence = product_info.get('catalogPresence') or {}
-                                    stock_status = presence.get('value', 'Unknown')
-                                    
-                                    # 5. SEO & Advertising Metrics
-                                    algo_score = item.get('score', '0')
-                                    advert_data = item.get('advert') or {}
-                                    is_ad = bool(advert_data)
-                                    ad_weight = advert_data.get('advert_weight_adv', '0')
-                                    ad_commission = advert_data.get('commission_type', 'organic')
-
-                                    # 6. Append everything to the master dictionary
-                                    clean_products.append({
-                                        "id": product_id,
-                                        "category_alias": category_alias,
-                                        "name": product_info.get('name'),
-                                        "brand": brand_name,
-                                        "price_original": product_info.get('price'),
-                                        "price_discounted": product_info.get('discountedPrice', ''),
-                                        "stock_status": stock_status,
-                                        "sku": product_info.get('sku', ''),
-                                        "url_product": url_product,
-                                        "company_name": company.get('name', 'Unknown'),
-                                        "company_region": company.get('regionName', 'Unknown'),
-                                        "company_num_review": f"{stats.get('opinionTotal', '0')}",
-                                        "company_per_pos_review": f"{stats.get('opinionPositivePercent', '0')}%",
-                                        "algo_score": algo_score,
-                                        "is_ad": is_ad,
-                                        "ad_weight": ad_weight,
-                                        "ad_commission_type": ad_commission
-                                    })
-                                    
-                            if clean_products:
-                                return clean_products, total_items
+                            # 🟢 Get the very first item's ID on this page
+                            first_item_id = str(products[0].get('product', {}).get('id'))
                             
-            elif response.status_code in [429, 403]:
-                logging.warning(f"⚠️ Page {page_num} hit Status {response.status_code} (Attempt {attempt}/{max_inline_retries}). Pausing...")
-                time.sleep(3 * attempt)
-            else:
-                logging.warning(f"⚠️ Page {page_num} returned abnormal status {response.status_code} on attempt {attempt}")
-                
+                            # 🟢 CHECK 2: Is this just Page 1 repeating?
+                            if page_num > 1 and page_1_anchor_id and first_item_id == page_1_anchor_id:
+                               
+                                return 0, None
+                            
+                            items_per_page = 30 
+                            
+                            for local_index, item in enumerate(products):
+                                product_info = item.get('product', {})
+                                if product_info:
+                                    absolute_position = (page_num - 1) * items_per_page + (local_index + 1)
+                                    prod_id = str(product_info.get('id'))
+                                    
+                                    raw_discount = product_info.get('discountedPrice')
+                                    raw_price = product_info.get('price')
+                                    if raw_discount: price = float(raw_discount)
+                                    elif raw_price: price = float(raw_price)
+                                    else: price = 0.0
+                                    
+                                    stock = product_info.get('catalogPresence', {}).get('value', 'Unknown')
+                                    name = product_info.get('name', '')
+                                    url = f"https://prom.ua/ua/p{prod_id}-{product_info.get('urlText', '')}.html"
+                                    
+                                    data_queue.put((
+                                        session_id, prod_id, category_alias, name, url, absolute_position, price, stock
+                                    ))
+                                    
+                            items_found = len(products)
+                           
+                            return items_found, first_item_id, total_items
+                            
+            time.sleep(2)
         except Exception as e:
-            logging.warning(f"⚠️ Connection glitch on Page {page_num} (Attempt {attempt}/{max_inline_retries}): {e}")
-            time.sleep(1)
+            time.sleep(2)
             
-    return [], 0
+    logging.error(f"    ❌ Page {page_num}: FAILED after 3 attempts.")
+    return 0, None, 0
 
-
-def analyze_global_catalog(category_tree):
-    """
-    Analyzes the ENTIRE platform tree from the 'root' up.
-    Prints a clean department-level summary for user verification, 
-    and returns EVERY single lowest-level leaf category on the site.
-    """
-    children_map = {}
-    for alias, data in category_tree.items():
-        parent = data.get("parent_alias", "root")
-        if parent not in children_map:
-            children_map[parent] = []
-        children_map[parent].append(alias)
-
-    all_global_leaf_nodes = []
-
-    def collect_leaves(current_alias):
-        leaves = []
-        if current_alias in children_map:
-            for child_alias in children_map[current_alias]:
-                leaves.extend(collect_leaves(child_alias))
-        else:
-            leaves.append(current_alias)
-        return leaves
-
-    print("\n🌳 --- SYSTEM BOUNDS VERIFICATION: GLOBAL CATALOG TREE --- 🌳")
-    print(f"Total entries discovered in mapping cache: {len(category_tree)}")
-    print("----------------------------------------------------------------")
-
-    top_departments = children_map.get("root", [])
-    for dept_alias in top_departments:
-        dept_name = category_tree.get(dept_alias, {}).get("name", dept_alias)
-        dept_leaves = collect_leaves(dept_alias)
-        all_global_leaf_nodes.extend(dept_leaves)
-        print(f" 📂 Department: {dept_name:<30} | Alias: {dept_alias:<25} | Hiding {len(dept_leaves):>4} Scraper Targets")
-
-    print("----------------------------------------------------------------")
-    print(f"🏆 GLOBAL TARGET MATRIX COMPLETE: Ready to extract {len(all_global_leaf_nodes)} total categories.")
-    print("================================================================\n")
+# ==========================================
+# 5. THE DELTA ANALYZER (CHANGES & ALERTS)
+# ==========================================
+def analyze_deltas(current_session_id, category_alias):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
     
-    return all_global_leaf_nodes
-
-
-def main():
-    setup_database("prom_master.db")
-
-    try:
-        with open("prom_category_tree.json", "r", encoding="utf-8") as f:
-            category_tree = json.load(f)
-    except FileNotFoundError:
-        logging.error("❌ Critical Pipeline Halt: 'prom_category_tree.json' missing from workspace. Run your mapper script first.")
-        return
-
-    target_subcategories = analyze_global_catalog(category_tree)
-    if not target_subcategories:
-        logging.warning("⚠️ Scraper target run matrix evaluated to empty. Aborting run pipeline.")
+    # Find the PREVIOUS successful run for this exact category
+    cursor.execute('''
+        SELECT session_id FROM scrape_sessions 
+        WHERE status = 'completed' AND target_category = ? AND session_id < ?
+        ORDER BY session_id DESC LIMIT 1
+    ''', (category_alias, current_session_id))
+    
+    prev_run = cursor.fetchone()
+    
+    if not prev_run:
+        logging.info(f"📊 Delta Analysis: No previous run found for {category_alias}. Establishing baseline.")
+        conn.close()
         return
         
-    # --- NEW RESUMPTION LOGIC ---
-    # Check the database to see which categories we already successfully scraped
-    conn = sqlite3.connect("prom_master.db")
+    prev_session_id = prev_run[0]
+    logging.info(f"🔍 Analyzing Changes between Run {prev_session_id} and Run {current_session_id} for {category_alias}...")
+    
+    alerts_to_insert = []
+    
+    # A. Detect Price Changes and Rank Shifts (Items that exist in BOTH runs)
+    cursor.execute('''
+        SELECT 
+            c.product_id, c.name, 
+            p.price AS old_price, c.price AS new_price,
+            p.category_position AS old_rank, c.category_position AS new_rank
+        FROM ranking_history c
+        JOIN ranking_history p ON c.product_id = p.product_id
+        WHERE c.session_id = ? AND p.session_id = ? AND c.category_alias = ?
+    ''', (current_session_id, prev_session_id, category_alias))
+    
+    for row in cursor.fetchall():
+        prod_id, name, old_price, new_price, old_rank, new_rank = row
+        
+        if old_price != new_price:
+            msg = f"PRICE CHANGE: {old_price} -> {new_price} | {name}"
+            alerts_to_insert.append((current_session_id, prod_id, category_alias, "PRICE_CHANGE", msg))
+            
+        rank_diff = old_rank - new_rank
+        if abs(rank_diff) >= 5: # Only alert if it jumped more than 5 spots
+            direction = "UP" if rank_diff > 0 else "DOWN"
+            msg = f"RANK MOVED {direction}: #{old_rank} to #{new_rank} | {name}"
+            alerts_to_insert.append((current_session_id, prod_id, category_alias, "RANK_SHIFT", msg))
+
+    # B. Detect Missing Items (Dropped out of the category)
+    cursor.execute('''
+        SELECT product_id, name, category_position FROM ranking_history 
+        WHERE session_id = ? AND category_alias = ?
+        AND product_id NOT IN (SELECT product_id FROM ranking_history WHERE session_id = ? AND category_alias = ?)
+    ''', (prev_session_id, category_alias, current_session_id, category_alias))
+    
+    for row in cursor.fetchall():
+        prod_id, name, old_rank = row
+        msg = f"DROPPED OUT: Was #{old_rank}, now completely missing | {name}"
+        alerts_to_insert.append((current_session_id, prod_id, category_alias, "DROPPED_OUT", msg))
+
+    # C. Detect Brand New Arrivals
+    cursor.execute('''
+        SELECT product_id, name, category_position FROM ranking_history 
+        WHERE session_id = ? AND category_alias = ?
+        AND product_id NOT IN (SELECT product_id FROM ranking_history WHERE session_id = ? AND category_alias = ?)
+    ''', (current_session_id, category_alias, prev_session_id, category_alias))
+    
+    for row in cursor.fetchall():
+        prod_id, name, new_rank = row
+        msg = f"NEW ARRIVAL: Appeared at #{new_rank} | {name}"
+        alerts_to_insert.append((current_session_id, prod_id, category_alias, "NEW_ARRIVAL", msg))
+
+    # Save Alerts
+    if alerts_to_insert:
+        cursor.executemany('''INSERT INTO market_alerts 
+            (session_id, product_id, category_alias, alert_type, message) 
+            VALUES (?, ?, ?, ?, ?)''', alerts_to_insert)
+        conn.commit()
+        logging.info(f"🚨 Delta Analysis Complete: Saved {len(alerts_to_insert)} market alerts/changes to database.")
+    else:
+        logging.info("⚖️ Delta Analysis Complete: No significant market changes detected.")
+        
+    conn.close()
+
+# ==========================================
+# 6. ORCHESTRATOR
+# ==========================================
+def run_category_sweep(category_alias, run_type="targeted"):
+    session_id = int(time.time())
+    logging.info(f"\n==================================================")
+    logging.info(f"🚀 STARTING TRACKER SESSION: {session_id} | Target: {category_alias}")
+    logging.info(f"==================================================")
+    
+    # 1. Log Session Start
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT category_alias FROM products_surface")
-    completed_aliases = {row[0] for row in cursor.fetchall()}
+    cursor.execute("INSERT INTO scrape_sessions (session_id, run_type, target_category, status) VALUES (?, ?, ?, ?)", 
+                   (session_id, run_type, category_alias, "running"))
+    conn.commit()
+    conn.close()
+
+    # 2. Setup the Queue & Background Writer
+    data_queue = queue.Queue()
+    writer_thread = threading.Thread(target=db_writer_worker, args=(data_queue,))
+    writer_thread.start()
+
+    
+
+    # 3. Ping Page 1 to get the Anchor ID and the Total Items reported by Prom
+    page_1_url = f"https://prom.ua/ua/{category_alias}?sort=-score"
+    items_on_page_1, page_1_anchor, total_items = fetch_and_extract_page(session_id, page_1_url, 1, category_alias, data_queue)
+    
+    if items_on_page_1 > 0:
+        # 🟢 YOUR DYNAMIC LOGIC: Calculate base pages, then add the +48 buffer!
+        base_pages = math.ceil(total_items / 30)
+        buffer_pages = 48 
+        max_pages_to_check = base_pages + buffer_pages 
+        
+        logging.info(f"📊 Target alive. Prom reports {total_items} items ({base_pages} pages). Adding +{buffer_pages} buffer. Scanning up to {max_pages_to_check} pages.")
+        
+        # 4. Launch 48 Workers
+        with concurrent.futures.ThreadPoolExecutor(max_workers=48) as executor:
+            futures = [
+                executor.submit(
+                    fetch_and_extract_page, 
+                    session_id, 
+                    f"https://prom.ua/ua/{category_alias};{p}?sort=-score", 
+                    p, 
+                    category_alias, 
+                    data_queue,
+                    page_1_anchor # Passes the anchor check!
+                ) 
+                for p in range(2, max_pages_to_check + 1)
+            ]
+            concurrent.futures.wait(futures)
+
+    # 5. Shut down queue safely
+    data_queue.put(None) 
+    writer_thread.join()
+
+    # 6. Mark Session Complete & Trigger Analyzer
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("UPDATE scrape_sessions SET status = 'completed' WHERE session_id = ?", (session_id,))
+    conn.commit()
     conn.close()
     
-    logging.info(f"📂 RESUMPTION CHECK: Found {len(completed_aliases)} categories already partially or fully in the database.")
-    logging.info("⏳ Countdown initiated. Review global department matrix above...")
-    time.sleep(5)
-    
-    for target_alias in target_subcategories:
-        # SKIP this category if it's already in the database
-        if target_alias in completed_aliases:
-            logging.info(f"⏭️ SKIPPING: {target_alias} (Already exists in database)")
-            continue
+    analyze_deltas(session_id, category_alias)
+    logging.info(f"🏁 SESSION {session_id} FULLY COMPLETE.\n")
 
-        base_url = f"https://prom.ua/ua/{target_alias}?sort=-score"
-        master_database = []
-        
-        logging.info(f"\n🚀 INITIATING MASS HARVEST: {target_alias}")
-        
-        page_1_data, total_items = fetch_and_extract_page(f"{base_url}&page=1", 1, target_alias)
-        
-        if not page_1_data:
-            logging.error(f"❌ Target context aborted: Handshake drop on {target_alias}. Skipping node.")
-            continue
-            
-        master_database.extend(page_1_data)
-        
-        items_per_page = 30
-        total_pages = math.ceil(total_items / items_per_page)
-        pages_to_scrape = total_pages 
-        
-        logging.info(f"📊 Bounds Evaluated: {total_items} entries across {pages_to_scrape} pages.")
-        
-        if pages_to_scrape <= 1:
-            logging.info(f"✅ Context extraction single-page allocation satisfied.")
-        else:
-            processing_track = {page: False for page in range(2, pages_to_scrape + 1)}
-            max_sweep_passes = 4
-            current_pass = 1
-            
-            while current_pass <= max_sweep_passes and not all(processing_track.values()):
-                pending_pages = [page for page, completed in processing_track.items() if not completed]
-                
-                # REDUCED WORKERS TO 16 TO PREVENT CLOUDFLARE TIMEOUT BANS
-                with concurrent.futures.ThreadPoolExecutor(max_workers=48) as executor:
-                    future_to_page = {
-                        executor.submit(fetch_and_extract_page, f"{base_url}&page={p}", p, target_alias): p 
-                        for p in pending_pages
-                    }
-                    
-                    for future in concurrent.futures.as_completed(future_to_page):
-                        page_num = future_to_page[future]
-                        try:
-                            page_data, _ = future.result()
-                            if page_data:
-                                master_database.extend(page_data)
-                                processing_track[page_num] = True  
-                            else:
-                                logging.error(f"❌ Segment {page_num} returned empty metrics.")
-                        except Exception as exc:
-                            logging.error(f"❌ Execution failure tracking index {page_num}: {exc}")
-                            
-                current_pass += 1
-                if not all(processing_track.values()):
-                    time.sleep(3)
-        
-        # SECURE LOCAL PERSISTENCE TO SQLITE DATABASE
-        if master_database:
-            upsert_products("prom_master.db", master_database)
-            
-        time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    init_db()
+    
+    # --- TOGGLE YOUR TARGETS HERE ---
+    
+    # MODE A: Targeted List (Just testing specific categories)
+    target_categories = ["Kaminy"] 
+    
+    # MODE B: Full Global Sweep (Uncomment to use)
+    # try:
+    #     with open("prom_category_tree.json", "r", encoding="utf-8") as f:
+    #         category_tree = json.load(f)
+    #         target_categories = [alias for alias in category_tree.keys()]
+    # except Exception:
+    #     pass
+
+    for category in target_categories:
+        run_category_sweep(category_alias=category, run_type="targeted_sweep")

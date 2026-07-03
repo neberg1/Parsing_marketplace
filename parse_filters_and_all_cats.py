@@ -25,9 +25,9 @@ logging.basicConfig(
 
 DB_NAME = "prom_master_run.db"
 TEMP_FILE = "prom_raw_data_fast.jsonl"
-FILE_LOCK = threading.Lock() # Protects the JSONL file from being corrupted by 48 workers writing at once
+FILE_LOCK = threading.Lock() 
 COMPETITOR_LOCK = threading.Lock()
-# Clear the temp file on startup
+
 with open(TEMP_FILE, 'w', encoding='utf-8') as f:
     pass
 
@@ -38,7 +38,6 @@ def setup_database():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # We added competitors_json to the end of this table
     cursor.execute('''CREATE TABLE IF NOT EXISTS products (
             id TEXT PRIMARY KEY, 
             category TEXT, 
@@ -48,9 +47,20 @@ def setup_database():
             price TEXT,
             is_ad BOOLEAN,
             company_name TEXT,
+            company_url TEXT,
             algo_score TEXT,
             filters_json TEXT,
-            competitors_json TEXT
+            competitors_json TEXT,
+            
+            sku TEXT,
+            image_large TEXT,
+            measure_unit TEXT,
+            selling_type TEXT,
+            availability_status TEXT,
+            company_data_json TEXT,
+            wholesale_json TEXT,
+            product_model_json TEXT,
+            advert_weight TEXT
         )''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS filter_progress (
             filter_url TEXT PRIMARY KEY
@@ -78,7 +88,6 @@ def mark_task_completed(table_name, column_name, value):
 # 3. PHASE 1: HIGH-SPEED EXTRACTION
 # ==========================================
 def save_to_temp_file(products_list):
-    """Instantly appends scraped data to a JSON Lines file. Zero waiting."""
     if not products_list: return
     with FILE_LOCK:
         with open(TEMP_FILE, 'a', encoding='utf-8') as f:
@@ -86,11 +95,10 @@ def save_to_temp_file(products_list):
                 f.write(json.dumps(p, ensure_ascii=False) + '\n')
 
 def get_headers(url):
-    """Strict headers to force Ukrainian locale and look like a real browser."""
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8", # FORCES UKRAINIAN
+        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8", 
         "Referer": url,
         "x-language": "uk"
     }
@@ -109,7 +117,7 @@ def fetch_filters_via_graphql(category_alias):
     payload = {
         "operationName": "CategoryFiltersQuery",
         "variables": {"regionId": None, "params": {"binary_filters": []}, "alias": category_alias},
-        "query": """query CategoryFiltersQuery($alias: String!, $manufacturer_id: Int, $params: Any, $company_id: Int, $sort: String, $regionId: Int = null, $subdomain: String = null) { listing: categoryListing(alias: $alias, manufacturer_id: $manufacturer_id, params: $params, company_id: $company_id, sort: $sort, region: {id: $regionId, subdomain: $subdomain}) { filters { ...FiltersFragment __typename } __typename } } fragment FiltersFragment on ListingFilters { total attributeFilters { name title type min max measureUnit values { value title __typename } __typename } __typename }"""
+        "query": """query CategoryFiltersQuery($alias: String!, $manufacturer_id: Int, $params: Any, $company_id: Int, $sort: String, $regionId: Int = null, $subdomain: String = null) { listing: categoryListing(alias: $alias, manufacturer_id: $manufacturer_id, params: $params, company_id: $company_id, sort: $sort, region: {id: $regionId, subdomain: $subdomain}) { filters { ...FiltersFragment __typename } __typename } } fragment FiltersFragment on ListingFilters { total attributeFilters { name title type min max measureUnit values { value title count __typename } __typename } __typename }"""
     }
 
     try:
@@ -120,17 +128,57 @@ def fetch_filters_via_graphql(category_alias):
         return {}
 
     structured_filters = {}
+    
     for attr in filters_data.get('attributeFilters', []):
-        group_title, group_name = attr.get('title'), attr.get('name')
-        if not group_name or not group_title or attr.get('type') == 'real': continue
+        group_internal_name = attr.get('name')
+        group_title = attr.get('title')
+        filter_type = attr.get('type')
         
+        if not group_internal_name or not group_title: 
+            continue
+            
         structured_filters[group_title] = []
-        for val in attr.get('values', []):
-            if val.get('value') and val.get('title'):
+        
+        if filter_type == 'real':
+            try:
+                min_val = int(attr.get('min', 0))
+                max_val = int(attr.get('max', 0))
+            except (ValueError, TypeError):
+                continue
+                
+            if max_val <= min_val:
+                continue
+
+            measure_unit = attr.get('measureUnit', '')
+            num_buckets = 5
+            step = math.ceil((max_val - min_val) / num_buckets)
+
+            for i in range(num_buckets):
+                bucket_min = min_val + (i * step)
+                bucket_max = bucket_min + step - 1 if i < num_buckets - 1 else max_val
+                
+                option_title = f"{bucket_min} - {bucket_max} {measure_unit}".strip()
+                query_params = {
+                    f"{group_internal_name}__gte": bucket_min,
+                    f"{group_internal_name}__lte": bucket_max
+                }
+                
                 structured_filters[group_title].append({
-                    "option_name": val.get('title'),
-                    "url": f"{base_category_url}?{urlencode({group_name: val.get('value')})}"
+                    "option_name": option_title,
+                    "url": f"{base_category_url}?{urlencode(query_params)}"
                 })
+        else:
+            for val in attr.get('values', []):
+                option_value_id = val.get('value')
+                option_title = val.get('title')
+                
+                if option_value_id and option_title:
+                    query_params = {group_internal_name: option_value_id}
+                    structured_filters[group_title].append({
+                        "option_name": option_title,
+                        "url": f"{base_category_url}?{urlencode(query_params)}"
+                    })
+
     return structured_filters
 
 def extract_page_data(task_url, category, filter_group, filter_option):
@@ -138,6 +186,11 @@ def extract_page_data(task_url, category, filter_group, filter_option):
     for attempt in range(1, 4):
         try:
             response = standard_requests.get(task_url, headers=headers, timeout=12)
+            
+            # Pagination redirect check
+            if ';' in task_url and ';' not in response.url:
+                return [], 0
+                
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 for script in soup.find_all('script'):
@@ -159,14 +212,55 @@ def extract_page_data(task_url, category, filter_group, filter_option):
                             product_info = item.get('product', {})
                             
                             if product_info:
-                                # 🟢 YOUR EXTRACTION LOGIC INTEGRATED HERE
                                 product_id = str(product_info.get('id'))
                                 url_product = f"https://prom.ua/ua/p{product_id}-{product_info.get('urlText', '')}.html"
-                                
-                                company = product_info.get('company', {})
                                 manufacturer = product_info.get('manufacturerInfo') or {}
-                                advert_data = item.get('advert') or {}
                                 
+                                image_large = product_info.get('imageAlt', '') or product_info.get('image400x400', '')
+
+                                selling_type_data = product_info.get('sellingType', {})
+                                selling_type = "Unknown"
+                                if 'universal' in selling_type_data:
+                                    selling_type = selling_type_data['universal'].get('title', 'Опт і Роздріб')
+                                elif 'retail' in selling_type_data:
+                                    selling_type = selling_type_data['retail'].get('title', 'Роздріб')
+
+                                company = product_info.get('company', {})
+                                company_id = company.get('id', '')
+                                company_slug = company.get('slug', '')
+                                company_url = f"https://prom.ua/ua/c{company_id}-{company_slug}.html" if company_id and company_slug else ""
+                                    
+                                opinion_stats = company.get('opinionStats', {})
+                                company_data = {
+                                    "regionName": company.get('regionName', ''),
+                                    "isService": company.get('isService', False),
+                                    "inTopSegment": company.get('inTopSegment', False),
+                                    "opinionPositivePercent": opinion_stats.get('opinionPositivePercent', 0),
+                                    "opinionTotal": opinion_stats.get('opinionTotal', 0)
+                                }
+
+                                raw_wholesale = product_info.get('wholesalePrices') or []
+                                clean_wholesale = [
+                                    {"min_qty": int(w.get('minimumOrderQuantity', 0)), "price": float(w.get('price', 0))}
+                                    for w in raw_wholesale if w.get('price')
+                                ]
+
+                                raw_model = item.get('productModel') or {}
+                                clean_model = {}
+                                if raw_model:
+                                    clean_model = {
+                                        "model_id": raw_model.get('model_id'),
+                                        "min_price": raw_model.get('min_price'),
+                                        "max_price": raw_model.get('max_price'),
+                                        "product_count": raw_model.get('product_count'),
+                                        "products": raw_model.get('model_product_ids', [])
+                                    }
+
+                                raw_advert = item.get('advert') or {}
+                                advert_weight = "0"
+                                if raw_advert:
+                                    advert_weight = str(raw_advert.get('advert_weight_adv', '0'))
+
                                 clean_products.append({
                                     "id": product_id,
                                     "category": category,
@@ -174,11 +268,23 @@ def extract_page_data(task_url, category, filter_group, filter_option):
                                     "url": url_product,
                                     "brand": manufacturer.get('name', 'Unknown'),
                                     "price": product_info.get('price'),
-                                    "is_ad": bool(advert_data),
+                                    "is_ad": bool(raw_advert),
                                     "company_name": company.get('name', 'Unknown'),
+                                    "company_url": company_url,
                                     "algo_score": str(item.get('score', '0')),
                                     "filter_group": filter_group,
-                                    "filter_option": filter_option
+                                    "filter_option": filter_option,
+                                    
+                                    "sku": product_info.get('sku', ''),
+                                    "image_large": image_large,
+                                    "measure_unit": product_info.get('measureUnit', 'шт.'),
+                                    "selling_type": selling_type,
+                                    "availability_status": product_info.get('catalogPresence', {}).get('title', 'Unknown'),
+                                    
+                                    "company_data_json": json.dumps(company_data, ensure_ascii=False),
+                                    "wholesale_json": json.dumps(clean_wholesale, ensure_ascii=False),
+                                    "product_model_json": json.dumps(clean_model, ensure_ascii=False),
+                                    "advert_weight": advert_weight
                                 })
                         
                         return clean_products, total_items
@@ -192,7 +298,6 @@ def extract_page_data(task_url, category, filter_group, filter_option):
 # 4. PHASE 1.5: SQLITE INGESTION
 # ==========================================
 def ingest_jsonl_to_sqlite():
-    """Reads the massive JSONL file, merges all duplicate items, and bulk saves rich data to SQLite."""
     if not os.path.exists(TEMP_FILE) or os.path.getsize(TEMP_FILE) == 0:
         return
 
@@ -208,7 +313,6 @@ def ingest_jsonl_to_sqlite():
                 p = json.loads(line)
                 pid = p['id']
                 
-                # Setup the base data dictionary if we haven't seen this ID yet
                 if pid not in merged_data:
                     merged_data[pid] = {
                         "category": p['category'], 
@@ -218,11 +322,22 @@ def ingest_jsonl_to_sqlite():
                         "price": p.get('price', ''),
                         "is_ad": p.get('is_ad', False),
                         "company_name": p.get('company_name', 'Unknown'),
+                        "company_url": p.get('company_url', ''),
                         "algo_score": p.get('algo_score', '0'),
+                        
+                        "sku": p.get('sku', ''),
+                        "image_large": p.get('image_large', ''),
+                        "measure_unit": p.get('measure_unit', ''),
+                        "selling_type": p.get('selling_type', ''),
+                        "availability_status": p.get('availability_status', ''),
+                        "company_data_json": p.get('company_data_json', '{}'),
+                        "wholesale_json": p.get('wholesale_json', '[]'),
+                        "product_model_json": p.get('product_model_json', '{}'),
+                        "advert_weight": p.get('advert_weight', '0'),
+                        
                         "filters": {}
                     }
                 
-                # Append the filter data
                 f_group, f_option = p['filter_group'], p['filter_option']
                 if f_group not in merged_data[pid]["filters"]:
                     merged_data[pid]["filters"][f_group] = []
@@ -235,7 +350,6 @@ def ingest_jsonl_to_sqlite():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # Process in chunks to avoid SQLite parameter limits
     ids = list(merged_data.keys())
     chunk_size = 900
     existing_db_data = {}
@@ -256,20 +370,26 @@ def ingest_jsonl_to_sqlite():
             for opt in options:
                 if opt not in db_filters[group]: db_filters[group].append(opt)
                     
-        # 🟢 EXACT COLUMN MATCHING
         records_to_upsert.append((
             pid, mem_data['category'], mem_data['name'], mem_data['url'], 
             mem_data['brand'], str(mem_data['price']), mem_data['is_ad'], 
-            mem_data['company_name'], mem_data['algo_score'], 
-            json.dumps(db_filters, ensure_ascii=False)
+            mem_data['company_name'], mem_data['company_url'], mem_data['algo_score'], 
+            json.dumps(db_filters, ensure_ascii=False),
+            
+            mem_data['sku'], mem_data['image_large'],
+            mem_data['measure_unit'], mem_data['selling_type'], mem_data['availability_status'],
+            mem_data['company_data_json'], mem_data['wholesale_json'], mem_data['product_model_json'],
+            mem_data['advert_weight']
         ))
     
     for i in range(0, len(records_to_upsert), chunk_size):
         chunk = records_to_upsert[i:i + chunk_size]
-        # 🟢 UPDATED SQL UPSERT
+        
         cursor.executemany('''INSERT INTO products 
-            (id, category, name, url, brand, price, is_ad, company_name, algo_score, filters_json) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, category, name, url, brand, price, is_ad, company_name, company_url, algo_score, filters_json,
+             sku, image_large, measure_unit, selling_type, availability_status, 
+             company_data_json, wholesale_json, product_model_json, advert_weight) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET 
             filters_json = excluded.filters_json, 
             name = excluded.name, 
@@ -278,13 +398,24 @@ def ingest_jsonl_to_sqlite():
             price = excluded.price,
             is_ad = excluded.is_ad,
             company_name = excluded.company_name,
-            algo_score = excluded.algo_score''', chunk)
+            company_url = excluded.company_url,
+            algo_score = excluded.algo_score,
+            sku = excluded.sku,
+            image_large = excluded.image_large,
+            measure_unit = excluded.measure_unit,
+            selling_type = excluded.selling_type,
+            availability_status = excluded.availability_status,
+            company_data_json = excluded.company_data_json,
+            wholesale_json = excluded.wholesale_json,
+            product_model_json = excluded.product_model_json,
+            advert_weight = excluded.advert_weight''', chunk)
         
     conn.commit()
     conn.close()
     
     os.remove(TEMP_FILE)
     logging.info("    ✅ Ingestion complete. Temp file deleted.")
+
 # ==========================================
 # 5. PHASE 2: COMPETITOR EXTRACTION
 # ==========================================
@@ -309,17 +440,17 @@ def extract_competitors_for_product(product_id, target_url):
         if response.status_code == 200:
             items = response.json().get('data', {}).get('recommendedNew', [])
             
-            # 🟢 Create a simple list of just the URLs
-            competitor_links = []
+            competitor_ids = []
             for item in items:
                 p = item.get('product')
-                if p:
-                    competitor_links.append(f"https://prom.ua/ua/p{p['id']}-{p.get('urlText')}.html")
+                if p and p.get('id'):
+                    competitor_ids.append(str(p['id']))
                     
-            return competitor_links, 200
+            return competitor_ids, 200
         return [], response.status_code
     except Exception:
         return [], 500
+
 def run_competitor_sweep():
     logging.info("==================================================")
     logging.info("🚀 PHASE 2 INITIATED: INLINE COMPETITOR EXTRACTION")
@@ -328,7 +459,6 @@ def run_competitor_sweep():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # 🟢 Checkpoint Logic: Only select products that don't have competitors saved yet
     cursor.execute("SELECT id, url FROM products WHERE competitors_json IS NULL")
     pending_products = cursor.fetchall()
     
@@ -345,26 +475,23 @@ def run_competitor_sweep():
     start_time = time.time()
 
     def fetch_and_save(pid, url):
-        comp_links, status = extract_competitors_for_product(pid, url)
+        comp_ids, status = extract_competitors_for_product(pid, url)
         
         if status == 429:
             return "BLOCKED"
             
-        # Convert the list of links to a JSON string (e.g., '["url1", "url2"]')
-        json_links = json.dumps(comp_links, ensure_ascii=False)
+        json_ids = json.dumps(comp_ids, ensure_ascii=False)
             
         with COMPETITOR_LOCK:
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
-            # 🟢 UPDATE the existing row instead of making a new table
-            cursor.execute("UPDATE products SET competitors_json = ? WHERE id = ?", (json_links, pid))
+            cursor.execute("UPDATE products SET competitors_json = ? WHERE id = ?", (json_ids, pid))
             conn.commit()
             conn.close()
             
         return "SUCCESS"
 
-    # Launching 16 workers
-    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=48) as executor:
         future_to_pid = {executor.submit(fetch_and_save, pid, url): pid for pid, url in pending_products}
         
         for future in concurrent.futures.as_completed(future_to_pid):
@@ -381,6 +508,7 @@ def run_competitor_sweep():
 
     elapsed = round((time.time() - start_time) / 60, 2)
     logging.info(f"✅ Phase 2 finished in {elapsed} minutes.")
+
 # ==========================================
 # 6. ORCHESTRATOR
 # ==========================================
@@ -415,7 +543,6 @@ def main():
                 save_to_temp_file(items)
                 total_pages = math.ceil(total / 30)
                 
-                # Add pages 2 onwards to the Master Queue
                 for p in range(2, total_pages + 1):
                     master_queue.append({
                         "url": f"{task['url']}&page={p}",
@@ -426,10 +553,15 @@ def main():
                 mark_task_completed("filter_progress", "filter_url", task['url'])
 
     if master_queue:
+        with open("queued_filter_pages.txt", "w", encoding="utf-8") as f:
+            for task in master_queue:
+                url_to_save = task['url'] if isinstance(task, dict) else task[0]
+                f.write(f"{url_to_save}\n")
+        logging.info(f"✅ Saved {len(master_queue)} URLs to 'queued_filter_pages.txt' for verification.")
+
         logging.info(f"🎯 Step B: Launching Continuous 48-Worker Grind on {len(master_queue)} total pages...")
         completed_pages_count = 0
         
-        # 48 Workers hitting the queue without ever stopping
         with concurrent.futures.ThreadPoolExecutor(max_workers=48) as executor:
             future_to_url = {
                 executor.submit(extract_page_data, item['url'], target_category, item['group'], item['option']): item 
@@ -447,16 +579,12 @@ def main():
                 if completed_pages_count % 50 == 0:
                     logging.info(f"    🔥 ACTIVE GRIND: {completed_pages_count}/{len(master_queue)} pages complete...")
                     
-    # Mark all base URLs as completed so we don't repeat them on next run
     for task in filter_tasks:
         mark_task_completed("filter_progress", "filter_url", task['url'])
         
     logging.info(f"\n🏁 PHASE 1 SCRAPING COMPLETE in {round((time.time() - phase_1_start) / 60, 2)} minutes.")
     
-    # --- PHASE 1.5 ---
     ingest_jsonl_to_sqlite()
-    
-    # --- PHASE 2 ---
     run_competitor_sweep()
     logging.info("\n🎉 PIPELINE FULLY COMPLETE.")
 

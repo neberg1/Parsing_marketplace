@@ -7,8 +7,7 @@ import threading
 import json
 import os
 from urllib.parse import urlencode
-import requests as standard_requests
-from curl_cffi import requests as cffi_requests
+import requests
 
 # ==========================================
 # 1. CONFIGURATION & TELEGRAM
@@ -30,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s',
 def send_telegram_alert(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        standard_requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": f"🤖 Prom Scraper:\n{message}"}, timeout=5)
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": f"🤖 Prom Scraper:\n{message}"}, timeout=5)
     except Exception as e:
         logging.error(f"Failed to send Telegram message: {e}")
 
@@ -75,7 +74,7 @@ def fetch_filters_via_graphql(category_alias):
     }
 
     try:
-        response = standard_requests.post('https://prom.ua/graphql', headers=headers, json=payload, timeout=15)
+        response = requests.post('https://prom.ua/graphql', headers=headers, json=payload, timeout=15)
         filters_data = response.json()['data']['listing']['filters']
     except Exception: return {}
 
@@ -106,16 +105,16 @@ def extract_page_data(task_url, category, filter_group, filter_option):
     headers = get_headers(task_url)
     for attempt in range(1, 4):
         try:
-            response = standard_requests.get(task_url, headers=headers, timeout=12)
+            response = requests.get(task_url, headers=headers, timeout=12)
             
-            # 🟢 Pagination redirect check
+            # Pagination redirect check
             if ';' in task_url and ';' not in response.url:
                 return [], 0, "OK"
                 
             if response.status_code == 200:
                 html_text = response.text
                 
-                # 🟢 Blazing fast string search (No BeautifulSoup)
+                # Blazing fast string search (No BeautifulSoup)
                 marker = "window.ApolloCacheState = "
                 start_idx = html_text.find(marker)
                 
@@ -242,7 +241,15 @@ def extract_competitors_for_product(product_id, target_url):
         "query": "query GlobalRecommendedBlockQuery($product_id: Long!, $visited_ids: [Long!]!, $favorite_ids: [Long!]!, $limit: Int, $offset: Int) { recommendedNew(product_id: $product_id visited_ids: $visited_ids favorite_ids: $favorite_ids limit: $limit offset: $offset) { product { id urlText __typename } __typename } }"
     }
     try:
-        response = cffi_requests.post("https://prom.ua/graphql", json=payload, headers={"accept": "*/*", "content-type": "application/json", "origin": "https://prom.ua", "referer": target_url, "x-apollo-operation-name": "GlobalRecommendedBlockQuery"}, impersonate="chrome120", timeout=15)
+        headers = {
+            "accept": "*/*", 
+            "content-type": "application/json", 
+            "origin": "https://prom.ua", 
+            "referer": target_url, 
+            "x-apollo-operation-name": "GlobalRecommendedBlockQuery", 
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
+        }
+        response = requests.post("https://prom.ua/graphql", json=payload, headers=headers, timeout=15)
         if response.status_code == 200:
             return [str(item['product']['id']) for item in response.json().get('data', {}).get('recommendedNew', []) if item.get('product', {}).get('id')], 200
         return [], response.status_code
@@ -255,20 +262,27 @@ def run_competitor_sweep():
     
     if not pending: return
 
-    def fetch_and_save(pid, url):
+    batch_results = []
+
+    def fetch_in_memory(pid, url):
         comp_ids, status = extract_competitors_for_product(pid, url)
-        if status == 429: return "BLOCKED"
-        with COMPETITOR_LOCK:
-            c = sqlite3.connect(DB_NAME)
-            c.execute("UPDATE products SET competitors_json = ? WHERE id = ?", (json.dumps(comp_ids, ensure_ascii=False), pid))
-            c.commit()
-            c.close()
-        return "SUCCESS"
+        if status == 429: return pid, None, "BLOCKED"
+        return pid, json.dumps(comp_ids, ensure_ascii=False), "SUCCESS"
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for future in concurrent.futures.as_completed({executor.submit(fetch_and_save, p[0], p[1]): p for p in pending}):
-            if future.result() == "BLOCKED":
+        futures = {executor.submit(fetch_in_memory, p[0], p[1]): p for p in pending}
+        for future in concurrent.futures.as_completed(futures):
+            pid, comp_data, status = future.result()
+            if status == "SUCCESS":
+                batch_results.append((comp_data, pid))
+            elif status == "BLOCKED":
                 time.sleep(2)
+
+    if batch_results:
+        conn = sqlite3.connect(DB_NAME)
+        conn.executemany("UPDATE products SET competitors_json = ? WHERE id = ?", batch_results)
+        conn.commit()
+        conn.close()
 
 # ==========================================
 # 6. THE 24/7 ORCHESTRATOR
@@ -277,9 +291,13 @@ def process_category(target_category):
     with open(TEMP_FILE, 'w', encoding='utf-8') as f: pass 
     
     filters_dict = fetch_filters_via_graphql(target_category)
+    if not filters_dict:
+        raise Exception(f"Failed to fetch initial filters for {target_category}. Blocking completion to prevent false DONE state.")
+
     filter_tasks = [{"group": g, "option": o['option_name'], "url": o['url']} for g, opts in filters_dict.items() for o in opts]
     
     master_queue = []
+    initial_errors = 0
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
         futures = {executor.submit(extract_page_data, f"{t['url']}&page=1", target_category, t['group'], t['option']): t for t in filter_tasks}
@@ -288,12 +306,17 @@ def process_category(target_category):
             items, total, status = future.result()
             
             if status == "ERROR":
+                initial_errors += 1
                 logging.warning(f"⚠️ Failed to load page: {t['url']}")
                 
             if items:
                 save_to_temp_file(items)
                 for p in range(2, math.ceil(total / 30) + 1):
                     master_queue.append({"url": f"{t['url']}&page={p}", "group": t['group'], "option": t['option']})
+
+    # The strict empty-data bypass: If we completely failed to get pages, crash immediately.
+    if not master_queue and initial_errors > 0:
+        raise Exception("No pagination data acquired but errors were detected. VPN might be blocked. Halting!")
 
     if master_queue:
         consecutive_errors = 0
@@ -327,7 +350,6 @@ def process_category(target_category):
 def main():
     setup_database()
     
-    # 🟢 NEW: Direct read from the JSON file you just generated
     if not os.path.exists(LEAF_TARGETS_FILE):
         logging.error(f"❌ {LEAF_TARGETS_FILE} not found! Please run the master tree builder first.")
         return
